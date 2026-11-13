@@ -1,0 +1,142 @@
+# ═══════════════════════════════════════════════════════════════════
+# AI-Powered Bid Platform — Docker Compose
+#
+# PROFILES:
+#   default (no profile)  → SQLite + local storage (dev/POC)
+#   --profile postgres    → adds PostgreSQL service
+#   --profile full        → PostgreSQL + Redis + Celery worker
+#
+# USAGE:
+#   Dev:        docker compose up
+#   Staging:    docker compose --profile postgres up
+#   Production: docker compose --profile full up
+#
+# Port config in ./backend/.env — no source changes needed.
+# ═══════════════════════════════════════════════════════════════════
+
+version: "3.9"
+
+services:
+
+  # ── PostgreSQL (optional — activate with --profile postgres or full) ──
+  postgres:
+    image: postgres:16-alpine
+    profiles: ["postgres", "full"]
+    environment:
+      POSTGRES_DB:       bidplatform
+      POSTGRES_USER:     biduser
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U biduser -d bidplatform"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    command: >
+      postgres
+        -c shared_preload_libraries=vector
+        -c max_connections=100
+
+  # ── Redis (always started — Celery uses it if available, ignored if not) ──
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Backend API ───────────────────────────────────────────────────
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "${PORT:-8010}:${PORT:-8010}"
+    volumes:
+      - ./backend:/app
+      - uploads_data:/app/uploads
+      - chroma_data:/app/chroma_db
+    env_file:
+      - ./backend/.env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: python run.py
+
+  # ── API with PostgreSQL dependency (--profile postgres or full) ───
+  api-postgres:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    profiles: ["postgres", "full"]
+    ports:
+      - "${PORT:-8010}:${PORT:-8010}"
+    volumes:
+      - ./backend:/app
+      - uploads_data:/app/uploads
+    env_file:
+      - ./backend/.env
+    environment:
+      - DATABASE_URL=postgresql://biduser:${POSTGRES_PASSWORD:-changeme}@postgres:5432/bidplatform
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: python run.py
+
+  # ── Celery worker (optional — activate with --profile full) ──────
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    profiles: ["full"]
+    volumes:
+      - ./backend:/app
+      - uploads_data:/app/uploads
+      - chroma_data:/app/chroma_db
+    env_file:
+      - ./backend/.env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: celery -A app.celery_app worker --loglevel=info --concurrency=2
+
+  # ── Frontend ──────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "${VITE_PORT:-5180}:${VITE_PORT:-5180}"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    env_file:
+      - ./frontend/.env.local
+    command: npm run dev -- --host 0.0.0.0
+
+volumes:
+  postgres_data:
+  redis_data:
+  uploads_data:
+  chroma_data:
